@@ -159,6 +159,19 @@ struct warp_group {
 // Memory region info structs for GIN (gin-deepep style)
 // All buffers are part of a single large gin_base_ptr buffer
 // Offsets are relative to gin_base_ptr (stored as size_t for offset calculation)
+// Warp-cooperative byte copy, 16B-vectorised. Token rows are HIDDEN*2 bytes.
+__forceinline__ __device__ void ep_gather_warp_copy(
+    uint8_t* __restrict__ dst, const uint8_t* __restrict__ src, size_t n, int lane) {
+    if (((reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src) |
+          static_cast<uintptr_t>(n)) & 15u) == 0) {
+        uint4* d = reinterpret_cast<uint4*>(dst);
+        const uint4* s = reinterpret_cast<const uint4*>(src);
+        for (size_t i = lane; i < n / 16; i += 32) d[i] = s[i];
+    } else {
+        for (size_t i = lane; i < n; i += 32) dst[i] = src[i];
+    }
+}
+
 struct dispatch_memory_region_info_t {
     size_t attn_input_token_offset;           // Offset of token staging buffer from gin_base_ptr
     size_t attn_input_prob_offset;             // Offset of prob staging buffer from gin_base_ptr
@@ -1812,40 +1825,81 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                 need_write_bitmask[i] = __ballot_sync(~0u, need_write);
             }
 
-            for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < csize;
-                 token_idx_in_chunk += ncclCoopWarp().size()) {
-                const int word = token_idx_in_chunk / 32;
-                const int lane_in_word = token_idx_in_chunk % 32;
-                size_t dst_offset = dense_dst_offset;
-
-                // Compact: skip space for earlier tokens in this word that aren't written.
-                if (lane_in_word > 0) {
-                    uint32_t writes_before = need_write_bitmask[word] & ((1u << lane_in_word) - 1);
-                    dst_offset += __popc(writes_before) * entry_bytes;
+            // GATHER-THEN-SEND (patched; hacks/make_gather_header_htep.py). Pack this chunk's
+            // written entries into the per-destination staging slab -- which mirrors the
+            // receiver's packed AoS byte for byte -- then move the dense run with ONE put instead
+            // of two or three per token. need_write_bitmask is __ballot_sync output and therefore
+            // warp-uniform, so every lane walks the same tokens and the copies are cooperative.
+            {
+                int chunk_writes = 0;
+                for (int i = 0; i < TOKENS_PER_CHUNK / 32; i++) {
+                    chunk_writes += __popc(need_write_bitmask[i]);
                 }
+                if (chunk_writes > 0) {
+                    const size_t stage_offset =
+                        smem_mr_info_ptr->gin_send_staging_offset +
+                        (static_cast<size_t>(remote_idx) * smem_mr_info_ptr->max_tokens_per_dest +
+                         static_cast<size_t>(chunk_first_token_idx)) * entry_bytes;
+                    uint8_t* stage =
+                        reinterpret_cast<uint8_t*>(ncclGetLocalPointer(nccl_internal_window, stage_offset));
 
-                bool need_write =
-                    attn_to_rdma_map[((chunk_first_token_idx + token_idx_in_chunk) * NUM_REMOTE_LSA) + remote_idx];
-                if (need_write) {
-                    int token_idx = chunk_first_token_idx + token_idx_in_chunk;
-                    dispatch_n2n_put_token<TOKEN_DATA_TYPE, FORWARD_DISPATCH, HAS_SF, LSA_TEAMS>(
-                        net,
-                        rail,
-                        remote_lteam_id,
-                        nccl_internal_window,
-                        dst_offset,
-                        smem_mr_info_ptr,
-                        nccl_token_window,
-                        nccl_prob_window,
-                        nccl_sf_window,
-                        token_idx,
-                        token_bytes,
-                        prob_bytes,
-                        sf_bytes_per_token,
-                        compact_prob);
+                    const int lane = ncclCoopWarp().thread_rank();
+                    int dense = 0;
+                    for (int t = 0; t < csize; ++t) {
+                        if (((need_write_bitmask[t / 32] >> (t % 32)) & 1u) == 0) continue;
+                        const int token_idx = chunk_first_token_idx + t;
+                        uint8_t* e = stage + static_cast<size_t>(dense) * entry_bytes;
+
+                        ep_gather_warp_copy(
+                            e,
+                            reinterpret_cast<const uint8_t*>(ncclGetLocalPointer(
+                                nccl_token_window,
+                                smem_mr_info_ptr->attn_input_token_offset +
+                                    static_cast<size_t>(token_idx) * token_bytes)),
+                            token_bytes, lane);
+
+                        if constexpr (FORWARD_DISPATCH) {
+                            // Must mirror dispatch_n2n_put_token: the dense row is sliced per
+                            // destination, the compact row is token-scoped and shared by all.
+                            const size_t prob_src =
+                                compact_prob
+                                    ? smem_mr_info_ptr->attn_input_prob_offset +
+                                          static_cast<size_t>(token_idx) * prob_bytes
+                                    : smem_mr_info_ptr->attn_input_prob_offset +
+                                          (static_cast<size_t>(token_idx) * LSA_TEAMS + remote_lteam_id) *
+                                              prob_bytes;
+                            ep_gather_warp_copy(
+                                e + token_bytes,
+                                reinterpret_cast<const uint8_t*>(
+                                    ncclGetLocalPointer(nccl_prob_window, prob_src)),
+                                prob_bytes, lane);
+                        }
+                        if constexpr (HAS_SF) {
+                            ep_gather_warp_copy(
+                                e + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0),
+                                reinterpret_cast<const uint8_t*>(ncclGetLocalPointer(
+                                    nccl_sf_window,
+                                    smem_mr_info_ptr->attn_input_scaling_factor_offset +
+                                        static_cast<size_t>(token_idx) * sf_bytes_per_token)),
+                                static_cast<size_t>(sf_bytes_per_token), lane);
+                        }
+                        ++dense;
+                    }
+
+                    __threadfence_system();
+                    __syncwarp();
+                    if (lane == 0) {
+                        net.put(
+                            rail, remote_lteam_id,
+                            nccl_internal_window, dense_dst_offset,
+                            nccl_internal_window, stage_offset,
+                            static_cast<size_t>(chunk_writes) * entry_bytes,
+                            ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},
+                            cuda::thread_scope_thread, cuda::thread_scope_device,
+                            ncclGinOptFlagsAggregateRequests);
+                    }
+                    __syncwarp();
                 }
-                // Advance the compacted base past all written tokens in this word.
-                dense_dst_offset += __popc(need_write_bitmask[word]) * entry_bytes;
             }
 
             // Signal chunk completion on the SAME put comm: same-QP ordering makes all
